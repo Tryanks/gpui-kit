@@ -536,16 +536,15 @@ impl<M: InputModeKind> TextElement<M> {
                 // Vertical cursor-follow is suppressed while auto-scroll manages the y axis,
                 // to prevent fighting the background scroll task.
                 if !auto_scrolling {
-                    // If we change the scroll_offset.y, GPUI will render and trigger the next run loop.
-                    // So, here we just adjust offset by `line_height` for move smooth.
+                    // An edit can move the caret many rows beyond a manually
+                    // scrolled viewport. Reveal it in this layout; a one-row
+                    // step leaves it offscreen until another edit arrives.
                     scroll_offset.y = if scroll_offset.y + cursor_pos.y
                         > bounds.size.height - top_bottom_margin
                     {
-                        // cursor is out of bottom
-                        scroll_offset.y - line_height
+                        bounds.size.height - top_bottom_margin - cursor_pos.y
                     } else if scroll_offset.y + cursor_pos.y < top_bottom_margin {
-                        // cursor is out of top
-                        (scroll_offset.y + line_height).min(px(0.))
+                        (top_bottom_margin - cursor_pos.y).min(px(0.))
                     } else {
                         scroll_offset.y
                     };

@@ -2880,6 +2880,9 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         self.update_fold_candidates_incremental(&range, new_text);
         M::refresh_language_features(self, window, cx);
         self.selected_range = (new_offset..new_offset).into();
+        // Replacement can leave the caret at the same offset while the user
+        // has scrolled it out of view. An accepted edit still needs reveal.
+        self.last_selected_range = None;
         self.ime_marked_range.take();
         self.update_preferred_column();
         self.update_search(cx);
@@ -2987,6 +2990,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
                 .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len())
                 .into();
         }
+        self.last_selected_range = None;
         if self.is_multi_line() {
             self.mode.update_auto_grow(&self.display_map);
         }
@@ -3300,6 +3304,105 @@ mod tests {
             Self::build_with(cx, move |window, cx| {
                 f(crate::input::InputState::new(window, cx))
             })
+        }
+    }
+
+    #[gpui::test]
+    fn edit_reveals_far_off_pasted_caret(cx: &mut TestAppContext) {
+        use gpui::{point, size};
+        cx.update(crate::init);
+        let view = InputView::build_textarea(cx, |state| state.auto_grow(2, 8));
+        let mut context = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let cx = &mut context;
+        let input = view.input;
+        let draw = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        };
+        cx.update(|window, cx| input.update(cx, |input, cx| input.focus(window, cx)));
+        for width in [720., 320.] {
+            cx.simulate_resize(size(px(width), px(400.)));
+            for wrapped in [false, true] {
+                let pasted = if wrapped {
+                    "wrapped pasted content ".repeat(200) + "END"
+                } else {
+                    (0..100)
+                        .map(|i| format!("Line {i:03} pasted content\n"))
+                        .collect::<String>()
+                        + "END"
+                };
+                for edit in ["insert", "replace", "delete", "ime"] {
+                    cx.update(|window, cx| {
+                        input.update(cx, |input, cx| input.set_value("", window, cx))
+                    });
+                    draw(cx);
+                    cx.update(|window, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(pasted.clone()));
+                        window.dispatch_action(Box::new(Paste), cx);
+                    });
+                    draw(cx);
+                    input.update(cx, |input, cx| {
+                        input.set_scroll_offset(point(px(0.), px(0.)), cx)
+                    });
+                    draw(cx);
+                    assert_eq!(
+                        input.read_with(cx, |input, _| input.scroll_offset().y),
+                        px(0.),
+                        "reading old text can scroll independently"
+                    );
+                    let end = pasted.len();
+                    let expected = match edit {
+                        "insert" => {
+                            cx.simulate_input("X");
+                            format!("{pasted}X")
+                        }
+                        "replace" => {
+                            cx.update(|window, cx| {
+                                input.update(cx, |input, cx| {
+                                    input.replace_text_in_range(Some(end - 1..end), "Y", window, cx)
+                                })
+                            });
+                            format!("{}Y", &pasted[..end - 1])
+                        }
+                        "delete" => {
+                            cx.update(|window, cx| {
+                                input.update(cx, |input, cx| {
+                                    input.replace_text_in_range(Some(end - 1..end), "", window, cx)
+                                })
+                            });
+                            pasted[..end - 1].to_string()
+                        }
+                        _ => {
+                            cx.update(|window, cx| {
+                                input.update(cx, |input, cx| {
+                                    input.replace_and_mark_text_in_range(
+                                        None,
+                                        "拼",
+                                        Some(1..1),
+                                        window,
+                                        cx,
+                                    )
+                                })
+                            });
+                            format!("{pasted}拼")
+                        }
+                    };
+                    draw(cx);
+                    input.read_with(cx, |input, _| {
+                        assert_eq!(input.value().as_ref(), expected);
+                        assert_eq!(input.selected_range(), expected.len()..expected.len(), "editing preserves the caret at the new text end");
+                        let (mut caret, _) = input.cursor_layout().expect("one edit must lay out the far-off caret");
+                        caret.origin.y += input.scroll_offset().y;
+                        let viewport = input.input_bounds();
+                        assert!(caret.top() >= viewport.top() && caret.bottom() <= viewport.bottom(), "width={width}, wrapped={wrapped}, edit={edit}: caret={caret:?}, viewport={viewport:?}, offset={:?}", input.scroll_offset());
+                    });
+                    cx.update(|window, cx| {
+                        input.update(cx, |input, cx| input.unmark_text(window, cx))
+                    });
+                }
+            }
         }
     }
 
