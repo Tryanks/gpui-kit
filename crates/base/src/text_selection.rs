@@ -833,6 +833,7 @@ struct WindowSelectionState {
     frame_generation: u64,
     finish_frame_scheduled: bool,
     mouse_down_prepared: bool,
+    activation_subscription: Option<Subscription>,
     auto_scroll: AutoScroll,
 }
 
@@ -1021,6 +1022,7 @@ impl WindowSelectionState {
 
     /// Ends the current gesture and keeps its selection visible.
     pub fn end(&mut self, cx: &mut App) {
+        self.mouse_down_prepared = false;
         self.pending_extension_anchor = None;
         if !self.is_selecting {
             return;
@@ -1236,6 +1238,11 @@ impl WindowSelectionState {
             self.clear(cx);
         }
         let endpoint = self.endpoint(position, window.as_deref(), cx);
+        // Proxy endpoints extend an existing drag between participants. They
+        // must not start one through an occluding surface or outside content.
+        if !endpoint.inside {
+            return;
+        }
         let focus_participant = endpoint
             .inside
             .then(|| endpoint.participant.clone())
@@ -1865,6 +1872,16 @@ fn retain_text_selection_state(
     cx.global_mut::<SelectionStateRegistry>()
         .0
         .insert(window_id, state.downgrade());
+    state.update(cx, |state, cx| {
+        if state.activation_subscription.is_none() {
+            state.activation_subscription =
+                Some(cx.observe_window_activation(window, |state, window, cx| {
+                    if !window.is_window_active() {
+                        state.end(cx);
+                    }
+                }));
+        }
+    });
     state
 }
 
@@ -1923,9 +1940,14 @@ fn paint_text_selection(state: &Entity<WindowSelectionState>, window: &mut Windo
 
     let mouse_move_state = state.downgrade();
     window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
-        if phase.bubble()
-            && let Some(state) = mouse_move_state.upgrade()
-        {
+        let Some(state) = mouse_move_state.upgrade() else {
+            return;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            if phase.capture() {
+                state.update(cx, |state, cx| state.end(cx));
+            }
+        } else if phase.bubble() {
             state.update(cx, |state, cx| {
                 state.update_in_window(event.position, window, cx)
             });
@@ -1934,14 +1956,14 @@ fn paint_text_selection(state: &Entity<WindowSelectionState>, window: &mut Windo
     });
 
     let mouse_up_state = state.downgrade();
-    window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
-        if phase.bubble()
+    window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+        // A foreground control can consume the release during bubbling.
+        // Selection must end before dispatch reaches that control.
+        if phase.capture()
+            && event.button == MouseButton::Left
             && let Some(state) = mouse_up_state.upgrade()
         {
-            state.update(cx, |state, cx| {
-                state.mouse_down_prepared = false;
-                state.end(cx)
-            });
+            state.update(cx, |state, cx| state.end(cx));
         }
     });
 
@@ -1993,6 +2015,25 @@ mod tests {
         cell::{Cell, RefCell},
         rc::Rc,
     };
+
+    struct ReleaseOverlayView {
+        content: Entity<WindowOwnedSelectionView>,
+    }
+
+    impl Render for ReleaseOverlayView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.content.clone()).child(
+                div()
+                    .absolute()
+                    .left(px(100.))
+                    .top_0()
+                    .w(px(100.))
+                    .h(px(100.))
+                    .occlude()
+                    .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
+            )
+        }
+    }
 
     struct FakeParticipant {
         selection: TextSelectionHandle,
@@ -3516,6 +3557,88 @@ mod tests {
         );
         cx.update(|window, cx| assert!(TextSelection::has_selection(window, cx)));
         assert_eq!(clear_count.get(), 3);
+    }
+
+    #[gpui::test]
+    fn dispatched_selection_drag_ends_on_consumed_release_or_cancellation(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, cx| ReleaseOverlayView {
+            content: cx.new(|cx| WindowOwnedSelectionView {
+                selection: TextSelectionHandle::new("selectable content", cx),
+            }),
+        });
+        cx.update(|window, cx| {
+            window.activate_window();
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_mouse_down(
+            point(px(150.), px(10.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.update(|window, cx| {
+            assert!(
+                !WindowSelectionState::ensure(window, cx)
+                    .read(cx)
+                    .is_selecting,
+                "a gesture on an occluding surface cannot arm selection underneath"
+            );
+        });
+        cx.simulate_mouse_move(
+            point(px(70.), px(10.)),
+            Some(MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            point(px(70.), px(10.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.update(|window, cx| assert!(!TextSelection::has_selection(window, cx)));
+        for cancellation in ["release", "button-up movement", "deactivation"] {
+            cx.simulate_mouse_down(
+                point(px(10.), px(10.)),
+                MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            cx.simulate_mouse_move(
+                point(px(70.), px(10.)),
+                Some(MouseButton::Left),
+                gpui::Modifiers::default(),
+            );
+            cx.update(|window, cx| {
+                assert!(
+                    WindowSelectionState::ensure(window, cx)
+                        .read(cx)
+                        .is_selecting
+                );
+            });
+            match cancellation {
+                "release" => cx.simulate_mouse_up(
+                    point(px(150.), px(10.)),
+                    MouseButton::Left,
+                    gpui::Modifiers::default(),
+                ),
+                "button-up movement" => cx.simulate_mouse_move(
+                    point(px(75.), px(10.)),
+                    None,
+                    gpui::Modifiers::default(),
+                ),
+                _ => cx.deactivate_window(),
+            }
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                let state = WindowSelectionState::ensure(window, cx);
+                assert!(
+                    !state.read(cx).is_selecting,
+                    "{cancellation} must end the dispatched gesture"
+                );
+                assert!(
+                    state.read(cx).has_selection(cx),
+                    "cancellation preserves selected text for copy"
+                );
+            });
+        }
     }
 
     #[gpui::test]
